@@ -15,18 +15,14 @@ class Decoration(BaseModel):
     location: Optional[str] = None
     raw_print_type: Optional[str] = None
     print_type: Optional[str] = None
-
     placement_raw: Optional[str] = None
     placement_key: Optional[str] = None
     placement_offset_raw: Optional[str] = None
-
     width_in: Optional[float] = None
     height_in: Optional[float] = None
     orientation: Optional[str] = None
-
     colors: List[str] = []
     specialty_print: List[str] = []
-
     page: Optional[int] = None
     confidence: float = 0.0
 
@@ -34,13 +30,11 @@ class Decoration(BaseModel):
 class ExtractResponse(BaseModel):
     filename: str
     pages: int
-
     product_code: Optional[str] = None
     product_title: Optional[str] = None
     catalog_product_name: Optional[str] = None
     product_type: Optional[str] = None
     product_classification_source: Optional[str] = None
-
     decorations: List[Decoration]
     raw_text_preview: Optional[str] = None
 
@@ -276,16 +270,47 @@ def find_product_code(text: str) -> Optional[str]:
     if not text:
         return None
 
-    text_upper = clean_pdf_text(text).upper()
+    cleaned = clean_pdf_text(text)
+    text_upper = cleaned.upper()
 
-    catalog_matches = STYLE_CODE_RE.findall(text_upper)
+    # 1. Prefer catalog codes anywhere in PDF text
+    if PRODUCT_CATALOG:
+        for code in sorted(PRODUCT_CATALOG.keys(), key=len, reverse=True):
+            code_upper = normalize_code(code)
 
-    for match in catalog_matches:
-        code = normalize_code(match)
-        if code in PRODUCT_CATALOG:
-            return code
+            if re.search(
+                rf"(?<![A-Z0-9]){re.escape(code_upper)}(?![A-Z0-9])",
+                text_upper,
+            ):
+                return code_upper
 
-    generic_matches = GENERIC_PRODUCT_CODE_RE.findall(text_upper)
+    # 2. Search product-title-like lines first
+    raw_lines = [
+        normalize_space(line)
+        for line in re.split(r"\n|\r", text or "")
+        if normalize_space(line)
+    ]
+
+    likely_lines = []
+
+    for line in raw_lines:
+        lower = line.lower()
+
+        if lower.startswith(("print type", "dimensions", "proof", "white", "black")):
+            continue
+
+        if "pantone" in lower:
+            continue
+
+        if re.search(
+            r"\b(next level|mercer|mettle|otto|cap|shirt|polo|hoodie|tee|tank|tote|bag|short|pant|jacket)\b",
+            lower,
+        ):
+            likely_lines.append(line)
+
+    search_text = " ".join(likely_lines) if likely_lines else cleaned
+
+    generic_matches = GENERIC_PRODUCT_CODE_RE.findall(search_text.upper())
 
     bad_codes = {
         "000",
@@ -300,10 +325,16 @@ def find_product_code(text: str) -> Optional[str]:
         if code in bad_codes:
             continue
 
-        if re.fullmatch(r"\d{6,}", code):
+        # Ignore Pantone-like colors such as 4525 C or 266 C
+        if re.search(rf"\b{re.escape(code)}\s*C\b", text_upper):
             continue
 
+        # Ignore common proof/order number prefixes from examples
         if code.startswith("277") or code.startswith("368"):
+            continue
+
+        # Avoid long proof/order-like pure numbers
+        if re.fullmatch(r"\d{6,}", code):
             continue
 
         return code
@@ -313,6 +344,9 @@ def find_product_code(text: str) -> Optional[str]:
 
 def lookup_product_from_catalog(text: str) -> Dict[str, Optional[str]]:
     product_code = find_product_code(text)
+
+    if product_code:
+        product_code = normalize_code(product_code)
 
     if product_code and product_code in PRODUCT_CATALOG:
         product = PRODUCT_CATALOG[product_code]
@@ -748,7 +782,6 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
         mupdf_text = mupdf_pages[i] if i < len(mupdf_pages) else ""
 
         best_text = plumber_text if len(plumber_text) >= len(mupdf_text) else mupdf_text
-
         pages.append(best_text)
 
     full_text = "\n".join(pages)
@@ -777,10 +810,7 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
 
     decorations = []
 
-    # Prefer detail pages, not summary page.
-    # Page 1 usually contains both front/back together and can create duplicates.
     detail_page_indexes = list(range(1, page_count)) if page_count > 1 else [0]
-
     detail_page_decorations = []
 
     for page_index in detail_page_indexes:
@@ -838,7 +868,6 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
 
     decorations = detail_page_decorations
 
-    # Fallback to page 1 only if detail pages did not produce usable decorations.
     if not decorations:
         page_text = clean_pdf_text(pages[0]) if pages else cleaned_text
         print_types = extract_print_types(page_text)
