@@ -99,14 +99,7 @@ SPECIALTY_KEYWORDS = {
 }
 
 PLACEHOLDER_RE = re.compile(r"\[\[.*?\]\]")
-
-
-# -----------------------------
-# Product catalog lookup
-# -----------------------------
-
 CATALOG_PATH = os.getenv("PRODUCT_CATALOG_PATH", "product_catalog.csv")
-PRODUCT_CATALOG: Dict[str, Dict[str, str]] = {}
 
 
 def clean_text(value: Any) -> str:
@@ -115,6 +108,19 @@ def clean_text(value: Any) -> str:
 
 def normalize_space(value: str) -> str:
     return re.sub(r"\s+", " ", clean_text(value)).strip()
+
+
+def clean_pdf_text(text: str) -> str:
+    text = text or ""
+    text = text.replace("”", '"')
+    text = text.replace("“", '"')
+    text = text.replace("′", "'")
+    text = text.replace("’", "'")
+    text = text.replace("–", "-")
+    text = text.replace("—", "-")
+    text = text.replace("ﬁ", "fi")
+    text = text.replace("\u00a0", " ")
+    return normalize_space(text)
 
 
 def normalize_code(value: Any) -> str:
@@ -129,23 +135,23 @@ def normalize_product_type(value: Optional[str]) -> Optional[str]:
 
     if key in ["shirt", "t-shirt", "tee", "short sleeve", "long sleeve"]:
         return "SHIRT"
-    if key in ["polo"]:
+    if key == "polo":
         return "POLO"
     if key in ["hat", "cap"]:
         return "HAT"
-    if key in ["beanie"]:
+    if key == "beanie":
         return "BEANIE"
-    if key in ["hoodie"]:
+    if key == "hoodie":
         return "HOODIE"
     if key in ["sweatshirt", "crewneck"]:
         return "SWEATSHIRT"
     if key in ["sweatpants/pants", "pants", "sweatpants", "joggers"]:
         return "SWEATPANTS_PANTS"
-    if key in ["shorts"]:
+    if key == "shorts":
         return "SHORTS"
     if key in ["tank top", "tank"]:
         return "TANK_TOP"
-    if key in ["jersey"]:
+    if key == "jersey":
         return "JERSEY"
     if key in ["tote bag", "tote"]:
         return "TOTE_BAG"
@@ -153,13 +159,13 @@ def normalize_product_type(value: Optional[str]) -> Optional[str]:
         return "BAG"
     if key in ["jacket/pullover", "jacket", "pullover", "quarter zip"]:
         return "JACKET_PULLOVER"
-    if key in ["banner"]:
+    if key == "banner":
         return "BANNER"
-    if key in ["sticker"]:
+    if key == "sticker":
         return "STICKER"
-    if key in ["poster"]:
+    if key == "poster":
         return "POSTER"
-    if key in ["other"]:
+    if key == "other":
         return "OTHER"
 
     return re.sub(r"[^A-Z0-9]+", "_", key.upper()).strip("_")
@@ -172,50 +178,64 @@ def load_product_catalog() -> Dict[str, Dict[str, str]]:
         print(f"Product catalog not found at {CATALOG_PATH}. Falling back to text-based product detection.")
         return catalog
 
-    with open(CATALOG_PATH, "r", encoding="utf-8-sig", newline="") as f:
-        sample = f.read(4096)
-        f.seek(0)
+    encodings = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
 
-        delimiter = "\t" if "\t" in sample else ","
-        reader = csv.DictReader(f, delimiter=delimiter)
+    for encoding in encodings:
+        try:
+            with open(
+                CATALOG_PATH,
+                "r",
+                encoding=encoding,
+                errors="ignore",
+                newline="",
+            ) as f:
+                sample = f.read(4096)
+                f.seek(0)
 
-        for row in reader:
-            product_code = normalize_code(
-                row.get("Product Code")
-                or row.get("product_code")
-                or row.get("Style Code")
-                or row.get("style_code")
-            )
+                delimiter = "\t" if "\t" in sample else ","
+                reader = csv.DictReader(f, delimiter=delimiter)
 
-            if not product_code:
-                continue
+                for row in reader:
+                    product_code = normalize_code(
+                        row.get("Product Code")
+                        or row.get("product_code")
+                        or row.get("Style Code")
+                        or row.get("style_code")
+                    )
 
-            product_name = normalize_space(
-                row.get("Product Name")
-                or row.get("product_name")
-                or row.get("Name")
-                or row.get("name")
-            )
+                    if not product_code:
+                        continue
 
-            classification = normalize_space(
-                row.get("Classification")
-                or row.get("classification")
-                or row.get("Product Type")
-                or row.get("product_type")
-            )
+                    product_name = normalize_space(
+                        row.get("Product Name")
+                        or row.get("product_name")
+                        or row.get("Name")
+                        or row.get("name")
+                    )
 
-            if not classification:
-                classification = "Other"
+                    classification = normalize_space(
+                        row.get("Classification")
+                        or row.get("classification")
+                        or row.get("Product Type")
+                        or row.get("product_type")
+                        or "Other"
+                    )
 
-            catalog[product_code] = {
-                "product_code": product_code,
-                "product_name": product_name,
-                "classification": classification,
-                "product_type": normalize_product_type(classification) or "OTHER",
-            }
+                    catalog[product_code] = {
+                        "product_code": product_code,
+                        "product_name": product_name,
+                        "classification": classification,
+                        "product_type": normalize_product_type(classification) or "OTHER",
+                    }
 
-    print(f"Loaded {len(catalog)} product catalog rows.")
-    return catalog
+                print(f"Loaded {len(catalog)} product catalog rows using encoding={encoding}.")
+                return catalog
+
+        except Exception as e:
+            print(f"Failed to load product catalog using encoding={encoding}: {e}")
+
+    print("Could not load product catalog. Falling back to text-based product detection.")
+    return {}
 
 
 PRODUCT_CATALOG = load_product_catalog()
@@ -225,7 +245,12 @@ def build_style_code_regex() -> re.Pattern:
     if PRODUCT_CATALOG:
         codes = sorted(PRODUCT_CATALOG.keys(), key=len, reverse=True)
         escaped = [re.escape(code) for code in codes if code]
-        return re.compile(r"(?<![A-Z0-9])(" + "|".join(escaped) + r")(?![A-Z0-9])", re.I)
+
+        if escaped:
+            return re.compile(
+                r"(?<![A-Z0-9])(" + "|".join(escaped) + r")(?![A-Z0-9])",
+                re.I,
+            )
 
     return re.compile(
         r"(?<![A-Z0-9])("
@@ -245,11 +270,11 @@ def find_product_code(text: str) -> Optional[str]:
         return None
 
     text_upper = clean_pdf_text(text).upper()
-
     matches = STYLE_CODE_RE.findall(text_upper)
 
     for match in matches:
         code = normalize_code(match)
+
         if code in PRODUCT_CATALOG:
             return code
 
@@ -261,6 +286,7 @@ def lookup_product_from_catalog(text: str) -> Dict[str, Optional[str]]:
 
     if product_code and product_code in PRODUCT_CATALOG:
         product = PRODUCT_CATALOG[product_code]
+
         return {
             "product_code": product_code,
             "catalog_product_name": product.get("product_name"),
@@ -274,23 +300,6 @@ def lookup_product_from_catalog(text: str) -> Dict[str, Optional[str]]:
         "product_type": None,
         "source": None,
     }
-
-
-# -----------------------------
-# PDF text and spec parsing
-# -----------------------------
-
-def clean_pdf_text(text: str) -> str:
-    text = text or ""
-    text = text.replace("”", '"')
-    text = text.replace("“", '"')
-    text = text.replace("′", "'")
-    text = text.replace("’", "'")
-    text = text.replace("–", "-")
-    text = text.replace("—", "-")
-    text = text.replace("ﬁ", "fi")
-    text = text.replace("\u00a0", " ")
-    return normalize_space(text)
 
 
 def is_placeholder(value: Optional[str]) -> bool:
@@ -468,7 +477,6 @@ def extract_dimension_specs(text: str) -> List[Dict[str, Any]]:
     for match in DIMENSION_RE.finditer(text):
         width = float(match.group("width"))
         height = float(match.group("height"))
-
         placement = match.group("placement")
 
         if placement:
@@ -543,10 +551,9 @@ def orientation(width: Optional[float], height: Optional[float]) -> Optional[str
 
 def extract_product_title(full_text: str) -> Optional[str]:
     original_text = full_text or ""
-
     catalog_lookup = lookup_product_from_catalog(original_text)
-    catalog_name = catalog_lookup.get("catalog_product_name")
     product_code = catalog_lookup.get("product_code")
+    catalog_name = catalog_lookup.get("catalog_product_name")
 
     lines = [
         normalize_space(x)
