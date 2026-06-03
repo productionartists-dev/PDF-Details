@@ -6,6 +6,7 @@ import pdfplumber
 import tempfile
 import re
 import os
+import csv
 
 app = FastAPI(title="Fresh Prints PDF Spec Extractor")
 
@@ -28,8 +29,13 @@ class Decoration(BaseModel):
 class ExtractResponse(BaseModel):
     filename: str
     pages: int
+
+    product_code: Optional[str] = None
     product_title: Optional[str] = None
+    catalog_product_name: Optional[str] = None
     product_type: Optional[str] = None
+    product_classification_source: Optional[str] = None
+
     decorations: List[Decoration]
     raw_text_preview: Optional[str] = None
 
@@ -95,6 +101,14 @@ SPECIALTY_KEYWORDS = {
 PLACEHOLDER_RE = re.compile(r"\[\[.*?\]\]")
 
 
+# -----------------------------
+# Product catalog lookup
+# -----------------------------
+
+CATALOG_PATH = os.getenv("PRODUCT_CATALOG_PATH", "product_catalog.csv")
+PRODUCT_CATALOG: Dict[str, Dict[str, str]] = {}
+
+
 def clean_text(value: Any) -> str:
     return str(value or "").replace("\u00a0", " ").strip()
 
@@ -102,6 +116,169 @@ def clean_text(value: Any) -> str:
 def normalize_space(value: str) -> str:
     return re.sub(r"\s+", " ", clean_text(value)).strip()
 
+
+def normalize_code(value: Any) -> str:
+    return normalize_space(value).upper()
+
+
+def normalize_product_type(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    key = normalize_space(value).lower()
+
+    if key in ["shirt", "t-shirt", "tee", "short sleeve", "long sleeve"]:
+        return "SHIRT"
+    if key in ["polo"]:
+        return "POLO"
+    if key in ["hat", "cap"]:
+        return "HAT"
+    if key in ["beanie"]:
+        return "BEANIE"
+    if key in ["hoodie"]:
+        return "HOODIE"
+    if key in ["sweatshirt", "crewneck"]:
+        return "SWEATSHIRT"
+    if key in ["sweatpants/pants", "pants", "sweatpants", "joggers"]:
+        return "SWEATPANTS_PANTS"
+    if key in ["shorts"]:
+        return "SHORTS"
+    if key in ["tank top", "tank"]:
+        return "TANK_TOP"
+    if key in ["jersey"]:
+        return "JERSEY"
+    if key in ["tote bag", "tote"]:
+        return "TOTE_BAG"
+    if key in ["bag", "backpack", "duffel"]:
+        return "BAG"
+    if key in ["jacket/pullover", "jacket", "pullover", "quarter zip"]:
+        return "JACKET_PULLOVER"
+    if key in ["banner"]:
+        return "BANNER"
+    if key in ["sticker"]:
+        return "STICKER"
+    if key in ["poster"]:
+        return "POSTER"
+    if key in ["other"]:
+        return "OTHER"
+
+    return re.sub(r"[^A-Z0-9]+", "_", key.upper()).strip("_")
+
+
+def load_product_catalog() -> Dict[str, Dict[str, str]]:
+    catalog = {}
+
+    if not os.path.exists(CATALOG_PATH):
+        print(f"Product catalog not found at {CATALOG_PATH}. Falling back to text-based product detection.")
+        return catalog
+
+    with open(CATALOG_PATH, "r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
+
+        delimiter = "\t" if "\t" in sample else ","
+        reader = csv.DictReader(f, delimiter=delimiter)
+
+        for row in reader:
+            product_code = normalize_code(
+                row.get("Product Code")
+                or row.get("product_code")
+                or row.get("Style Code")
+                or row.get("style_code")
+            )
+
+            if not product_code:
+                continue
+
+            product_name = normalize_space(
+                row.get("Product Name")
+                or row.get("product_name")
+                or row.get("Name")
+                or row.get("name")
+            )
+
+            classification = normalize_space(
+                row.get("Classification")
+                or row.get("classification")
+                or row.get("Product Type")
+                or row.get("product_type")
+            )
+
+            if not classification:
+                classification = "Other"
+
+            catalog[product_code] = {
+                "product_code": product_code,
+                "product_name": product_name,
+                "classification": classification,
+                "product_type": normalize_product_type(classification) or "OTHER",
+            }
+
+    print(f"Loaded {len(catalog)} product catalog rows.")
+    return catalog
+
+
+PRODUCT_CATALOG = load_product_catalog()
+
+
+def build_style_code_regex() -> re.Pattern:
+    if PRODUCT_CATALOG:
+        codes = sorted(PRODUCT_CATALOG.keys(), key=len, reverse=True)
+        escaped = [re.escape(code) for code in codes if code]
+        return re.compile(r"(?<![A-Z0-9])(" + "|".join(escaped) + r")(?![A-Z0-9])", re.I)
+
+    return re.compile(
+        r"(?<![A-Z0-9])("
+        r"[A-Z]{1,5}\d{2,7}[A-Z0-9-]*"
+        r"|\d{2,6}-\d{2,6}"
+        r"|\d{3,7}"
+        r")(?![A-Z0-9])",
+        re.I,
+    )
+
+
+STYLE_CODE_RE = build_style_code_regex()
+
+
+def find_product_code(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    text_upper = clean_pdf_text(text).upper()
+
+    matches = STYLE_CODE_RE.findall(text_upper)
+
+    for match in matches:
+        code = normalize_code(match)
+        if code in PRODUCT_CATALOG:
+            return code
+
+    return None
+
+
+def lookup_product_from_catalog(text: str) -> Dict[str, Optional[str]]:
+    product_code = find_product_code(text)
+
+    if product_code and product_code in PRODUCT_CATALOG:
+        product = PRODUCT_CATALOG[product_code]
+        return {
+            "product_code": product_code,
+            "catalog_product_name": product.get("product_name"),
+            "product_type": product.get("product_type") or "OTHER",
+            "source": "catalog",
+        }
+
+    return {
+        "product_code": product_code,
+        "catalog_product_name": None,
+        "product_type": None,
+        "source": None,
+    }
+
+
+# -----------------------------
+# PDF text and spec parsing
+# -----------------------------
 
 def clean_pdf_text(text: str) -> str:
     text = text or ""
@@ -111,6 +288,7 @@ def clean_pdf_text(text: str) -> str:
     text = text.replace("’", "'")
     text = text.replace("–", "-")
     text = text.replace("—", "-")
+    text = text.replace("ﬁ", "fi")
     text = text.replace("\u00a0", " ")
     return normalize_space(text)
 
@@ -180,39 +358,39 @@ def normalize_placement(value: Optional[str]) -> Optional[str]:
     return re.sub(r"[^A-Z0-9]+", "_", key.upper()).strip("_")
 
 
-def extract_product_type(product_title: Optional[str]) -> Optional[str]:
+def extract_product_type_from_text(product_title: Optional[str]) -> Optional[str]:
     if not product_title:
         return None
 
     title = normalize_space(product_title).lower()
 
-    if "polo" in title:
+    if re.search(r"\bpolo\b", title):
         return "POLO"
-    if "hoodie" in title:
+    if re.search(r"\bhoodie\b", title):
         return "HOODIE"
-    if "crewneck" in title:
-        return "CREWNECK"
-    if "sweatshirt" in title:
+    if re.search(r"\bcrewneck\b", title):
         return "SWEATSHIRT"
-    if "quarter zip" in title or "qz" in title:
-        return "QUARTER_ZIP"
-    if "shirt" in title or "tee" in title:
+    if re.search(r"\bsweatshirt\b", title):
+        return "SWEATSHIRT"
+    if re.search(r"\bquarter\s*zip\b|\bqz\b", title):
+        return "JACKET_PULLOVER"
+    if re.search(r"\bshirt\b|\btee\b|\bt-?shirt\b", title):
         return "SHIRT"
-    if "hat" in title or "cap" in title:
+    if re.search(r"\bhat\b|\bcap\b", title):
         return "HAT"
-    if "short" in title:
+    if re.search(r"\bshorts?\b", title):
         return "SHORTS"
-    if "pant" in title:
-        return "PANTS"
-    if "tote" in title:
-        return "TOTE"
-    if "bag" in title:
+    if re.search(r"\bpants?\b|\bsweatpants?\b|\bjoggers?\b", title):
+        return "SWEATPANTS_PANTS"
+    if re.search(r"\btote\b", title):
+        return "TOTE_BAG"
+    if re.search(r"\bbag\b|\bbackpack\b|\bduffel\b", title):
         return "BAG"
-    if "banner" in title:
+    if re.search(r"\bbanner\b", title):
         return "BANNER"
-    if "sticker" in title:
+    if re.search(r"\bsticker\b", title):
         return "STICKER"
-    if "poster" in title:
+    if re.search(r"\bposter\b", title):
         return "POSTER"
 
     return "OTHER"
@@ -366,11 +544,23 @@ def orientation(width: Optional[float], height: Optional[float]) -> Optional[str
 def extract_product_title(full_text: str) -> Optional[str]:
     original_text = full_text or ""
 
+    catalog_lookup = lookup_product_from_catalog(original_text)
+    catalog_name = catalog_lookup.get("catalog_product_name")
+    product_code = catalog_lookup.get("product_code")
+
     lines = [
         normalize_space(x)
         for x in re.split(r"\n|\r", original_text)
         if normalize_space(x)
     ]
+
+    if product_code:
+        for line in lines:
+            if product_code.upper() in line.upper():
+                return line
+
+    if catalog_name:
+        return catalog_name
 
     for line in lines:
         lower = line.lower()
@@ -378,20 +568,11 @@ def extract_product_title(full_text: str) -> Optional[str]:
         if lower.startswith(("print type", "dimensions", "size", "proof")):
             continue
 
-        if any(keyword in lower for keyword in PRODUCT_KEYWORDS):
+        if "bagels" in lower:
+            continue
+
+        if any(re.search(rf"\b{re.escape(keyword)}\b", lower) for keyword in PRODUCT_KEYWORDS):
             return line
-
-    text = clean_pdf_text(original_text)
-    before_print_type = re.split(r"Print\s*Type:", text, flags=re.I)[0]
-
-    candidates = re.split(r"\s{2,}|(?=[A-Z][a-z]+[+\s].*(?:Shirt|Polo|Hat|Cap|Tote|Bag|Hoodie|Short|Pant|Banner))", before_print_type)
-
-    for candidate in candidates:
-        candidate = normalize_space(candidate)
-        lower = candidate.lower()
-
-        if any(keyword in lower for keyword in PRODUCT_KEYWORDS):
-            return candidate
 
     return None
 
@@ -465,11 +646,26 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
     mupdf_text = pymupdf_text(pdf_path)
 
     full_text = plumber_text if len(plumber_text) >= len(mupdf_text) else mupdf_text
-
     cleaned_text = clean_pdf_text(full_text)
 
+    catalog_lookup = lookup_product_from_catalog(cleaned_text)
+
+    product_code = catalog_lookup.get("product_code")
+    catalog_product_name = catalog_lookup.get("catalog_product_name")
+
     product_title = extract_product_title(full_text)
-    product_type = extract_product_type(product_title)
+
+    product_type = (
+        catalog_lookup.get("product_type")
+        or extract_product_type_from_text(product_title)
+        or "OTHER"
+    )
+
+    product_classification_source = (
+        catalog_lookup.get("source")
+        if catalog_lookup.get("product_type")
+        else "text_fallback"
+    )
 
     print_types = extract_print_types(cleaned_text)
     dimensions = extract_dimension_specs(cleaned_text)
@@ -518,8 +714,11 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
     return ExtractResponse(
         filename=os.path.basename(pdf_path),
         pages=page_count,
+        product_code=product_code,
         product_title=product_title,
+        catalog_product_name=catalog_product_name,
         product_type=product_type,
+        product_classification_source=product_classification_source,
         decorations=decorations,
         raw_text_preview=cleaned_text[:1500],
     )
@@ -530,6 +729,8 @@ def health():
     return {
         "status": "ok",
         "service": "Fresh Prints PDF Spec Extractor",
+        "catalog_rows_loaded": len(PRODUCT_CATALOG),
+        "catalog_path": CATALOG_PATH,
     }
 
 
