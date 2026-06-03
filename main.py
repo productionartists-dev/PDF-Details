@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Any, Dict
-import fitz  # PyMuPDF
+import fitz
 import pdfplumber
 import tempfile
 import re
@@ -15,13 +15,18 @@ class Decoration(BaseModel):
     location: Optional[str] = None
     raw_print_type: Optional[str] = None
     print_type: Optional[str] = None
+
     placement_raw: Optional[str] = None
     placement_key: Optional[str] = None
+    placement_offset_raw: Optional[str] = None
+
     width_in: Optional[float] = None
     height_in: Optional[float] = None
     orientation: Optional[str] = None
+
     colors: List[str] = []
     specialty_print: List[str] = []
+
     page: Optional[int] = None
     confidence: float = 0.0
 
@@ -66,6 +71,18 @@ VALID_PRINT_TYPES = [
     "Digital Print",
 ]
 
+SPECIALTY_KEYWORDS = {
+    "puff": "PUFF",
+    "metallic": "METALLIC",
+    "foil": "FOIL",
+    "reflective": "REFLECTIVE",
+    "glow": "GLOW",
+    "high density": "HIGH_DENSITY",
+    "applique": "APPLIQUE",
+    "tackle twill": "TACKLE_TWILL",
+    "flock": "FLOCK",
+}
+
 PRODUCT_KEYWORDS = [
     "polo",
     "shirt",
@@ -85,18 +102,6 @@ PRODUCT_KEYWORDS = [
     "sticker",
     "poster",
 ]
-
-SPECIALTY_KEYWORDS = {
-    "puff": "PUFF",
-    "metallic": "METALLIC",
-    "foil": "FOIL",
-    "reflective": "REFLECTIVE",
-    "glow": "GLOW",
-    "high density": "HIGH_DENSITY",
-    "applique": "APPLIQUE",
-    "tackle twill": "TACKLE_TWILL",
-    "flock": "FLOCK",
-}
 
 PLACEHOLDER_RE = re.compile(r"\[\[.*?\]\]")
 CATALOG_PATH = os.getenv("PRODUCT_CATALOG_PATH", "product_catalog.csv")
@@ -175,7 +180,7 @@ def load_product_catalog() -> Dict[str, Dict[str, str]]:
     catalog = {}
 
     if not os.path.exists(CATALOG_PATH):
-        print(f"Product catalog not found at {CATALOG_PATH}. Falling back to text-based product detection.")
+        print(f"Product catalog not found at {CATALOG_PATH}.")
         return catalog
 
     encodings = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
@@ -228,13 +233,12 @@ def load_product_catalog() -> Dict[str, Dict[str, str]]:
                         "product_type": normalize_product_type(classification) or "OTHER",
                     }
 
-                print(f"Loaded {len(catalog)} product catalog rows using encoding={encoding}.")
+                print(f"Loaded {len(catalog)} product catalog rows using {encoding}.")
                 return catalog
 
         except Exception as e:
-            print(f"Failed to load product catalog using encoding={encoding}: {e}")
+            print(f"Failed to load catalog using {encoding}: {e}")
 
-    print("Could not load product catalog. Falling back to text-based product detection.")
     return {}
 
 
@@ -335,36 +339,85 @@ def extract_specialty_print(value: Optional[str]) -> List[str]:
     return sorted(set(found))
 
 
-def normalize_placement(value: Optional[str]) -> Optional[str]:
-    if not value or is_placeholder(value):
-        return None
+def infer_print_location(
+    product_type: Optional[str],
+    width: Optional[float],
+    height: Optional[float],
+    placement_offset_raw: Optional[str],
+    decoration_index: int,
+    total_decorations: int,
+) -> Optional[str]:
+    product_type = normalize_space(product_type or "").upper()
+    offset = normalize_space(placement_offset_raw or "").lower()
 
-    key = normalize_space(value).lower()
-
-    if "center" in key:
-        return "CENTERED"
-    if "collar" in key:
-        return "FROM_COLLAR"
-    if "bottom seam" in key:
-        return "FROM_BOTTOM_SEAM"
-    if "from seam" in key or "seam" in key:
-        return "FROM_SEAM"
-    if "left chest" in key or "left pec" in key:
-        return "LEFT_CHEST"
-    if "right chest" in key or "right pec" in key:
-        return "RIGHT_CHEST"
-    if "front" in key:
-        return "FRONT"
-    if "back" in key:
-        return "BACK"
-    if "left sleeve" in key:
+    if "left chest" in offset or "left pec" in offset:
+        return "FRONT_LEFT_CHEST"
+    if "right chest" in offset or "right pec" in offset:
+        return "FRONT_RIGHT_CHEST"
+    if "left sleeve" in offset:
         return "LEFT_SLEEVE"
-    if "right sleeve" in key:
+    if "right sleeve" in offset:
         return "RIGHT_SLEEVE"
-    if "pocket" in key:
-        return "POCKET"
+    if "front leg" in offset or "left leg" in offset:
+        return "FRONT_LEG"
+    if "back leg" in offset:
+        return "BACK_LEG"
+    if "front" in offset:
+        return "FRONT"
+    if "back" in offset:
+        return "BACK"
 
-    return re.sub(r"[^A-Z0-9]+", "_", key.upper()).strip("_")
+    if product_type in ["HAT", "BEANIE"]:
+        return "FRONT"
+
+    if product_type in ["SHORTS", "SWEATPANTS_PANTS", "PANTS"]:
+        if decoration_index == 0:
+            return "FRONT_LEG"
+        return "BACK_LEG"
+
+    if product_type in [
+        "SHIRT",
+        "POLO",
+        "HOODIE",
+        "SWEATSHIRT",
+        "JACKET_PULLOVER",
+        "TANK_TOP",
+        "JERSEY",
+    ]:
+        if width and height:
+            if width <= 4.5 and height <= 4.5 and "collar" in offset:
+                return "FRONT_LEFT_CHEST"
+
+            if total_decorations > 1 and (width >= 8 or height >= 8):
+                return "BACK"
+
+            if total_decorations == 1 and (width >= 8 or height >= 8):
+                return "FRONT"
+
+        if "center" in offset:
+            return "FRONT"
+
+        if decoration_index == 0:
+            return "FRONT"
+
+        if decoration_index == 1:
+            return "BACK"
+
+    if product_type in ["TOTE_BAG", "BAG"]:
+        if decoration_index == 0:
+            return "FRONT"
+        return "BACK"
+
+    if "center" in offset:
+        return "FRONT"
+
+    if decoration_index == 0:
+        return "FRONT"
+
+    if decoration_index == 1:
+        return "BACK"
+
+    return "UNKNOWN"
 
 
 def extract_product_type_from_text(product_title: Optional[str]) -> Optional[str]:
@@ -496,7 +549,7 @@ def extract_dimension_specs(text: str) -> List[Dict[str, Any]]:
             {
                 "width": width,
                 "height": height,
-                "placement": placement,
+                "placement_offset_raw": placement,
             }
         )
 
@@ -636,6 +689,7 @@ def dedupe_decorations(decorations: List[Decoration]) -> List[Decoration]:
             dec.width_in,
             dec.height_in,
             dec.placement_key,
+            dec.placement_offset_raw,
             tuple(dec.colors),
         )
 
@@ -679,7 +733,6 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
     colors = extract_colors(cleaned_text)
 
     decorations = []
-
     count = max(len(print_types), len(dimensions))
 
     for i in range(count):
@@ -688,17 +741,29 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
 
         width = dim.get("width")
         height = dim.get("height")
-        placement_raw = dim.get("placement")
+        placement_offset_raw = dim.get("placement_offset_raw")
 
         if is_placeholder(raw_print_type):
             continue
 
+        location_key = infer_print_location(
+            product_type=product_type,
+            width=width,
+            height=height,
+            placement_offset_raw=placement_offset_raw,
+            decoration_index=i,
+            total_decorations=count,
+        )
+
         dec = Decoration(
-            location=normalize_placement(placement_raw),
+            location=location_key,
             raw_print_type=raw_print_type,
             print_type=normalize_print_type(raw_print_type),
-            placement_raw=placement_raw,
-            placement_key=normalize_placement(placement_raw),
+
+            placement_raw=location_key,
+            placement_key=location_key,
+            placement_offset_raw=placement_offset_raw,
+
             width_in=width,
             height_in=height,
             orientation=orientation(width, height),
