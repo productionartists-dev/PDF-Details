@@ -245,6 +245,16 @@ def load_product_catalog() -> Dict[str, Dict[str, str]]:
 PRODUCT_CATALOG = load_product_catalog()
 
 
+GENERIC_PRODUCT_CODE_RE = re.compile(
+    r"(?<![A-Z0-9])("
+    r"[A-Z]{1,6}\d{2,7}[A-Z0-9-]*"
+    r"|\d{2,6}-\d{2,6}"
+    r"|\d{3,7}"
+    r")(?![A-Z0-9])",
+    re.I,
+)
+
+
 def build_style_code_regex() -> re.Pattern:
     if PRODUCT_CATALOG:
         codes = sorted(PRODUCT_CATALOG.keys(), key=len, reverse=True)
@@ -256,14 +266,7 @@ def build_style_code_regex() -> re.Pattern:
                 re.I,
             )
 
-    return re.compile(
-        r"(?<![A-Z0-9])("
-        r"[A-Z]{1,5}\d{2,7}[A-Z0-9-]*"
-        r"|\d{2,6}-\d{2,6}"
-        r"|\d{3,7}"
-        r")(?![A-Z0-9])",
-        re.I,
-    )
+    return GENERIC_PRODUCT_CODE_RE
 
 
 STYLE_CODE_RE = build_style_code_regex()
@@ -274,13 +277,36 @@ def find_product_code(text: str) -> Optional[str]:
         return None
 
     text_upper = clean_pdf_text(text).upper()
-    matches = STYLE_CODE_RE.findall(text_upper)
 
-    for match in matches:
+    catalog_matches = STYLE_CODE_RE.findall(text_upper)
+
+    for match in catalog_matches:
         code = normalize_code(match)
-
         if code in PRODUCT_CATALOG:
             return code
+
+    generic_matches = GENERIC_PRODUCT_CODE_RE.findall(text_upper)
+
+    bad_codes = {
+        "000",
+        "000C",
+        "001",
+        "00",
+    }
+
+    for match in generic_matches:
+        code = normalize_code(match)
+
+        if code in bad_codes:
+            continue
+
+        if re.fullmatch(r"\d{6,}", code):
+            continue
+
+        if code.startswith("277") or code.startswith("368"):
+            continue
+
+        return code
 
     return None
 
@@ -346,9 +372,16 @@ def infer_print_location(
     placement_offset_raw: Optional[str],
     decoration_index: int,
     total_decorations: int,
+    page_number: Optional[int] = None,
 ) -> Optional[str]:
     product_type = normalize_space(product_type or "").upper()
     offset = normalize_space(placement_offset_raw or "").lower()
+
+    if page_number == 2 and total_decorations >= 2:
+        return "FRONT"
+
+    if page_number == 3 and total_decorations >= 2:
+        return "BACK"
 
     if "left chest" in offset or "left pec" in offset:
         return "FRONT_LEFT_CHEST"
@@ -637,26 +670,26 @@ def extract_product_title(full_text: str) -> Optional[str]:
     return None
 
 
-def pdfplumber_text(pdf_path: str) -> str:
-    full_text = []
+def pdfplumber_pages_text(pdf_path: str) -> List[str]:
+    pages_text = []
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             text = page.extract_text(x_tolerance=2, y_tolerance=3) or ""
-            full_text.append(text)
+            pages_text.append(text)
 
-    return "\n".join(full_text)
+    return pages_text
 
 
-def pymupdf_text(pdf_path: str) -> str:
+def pymupdf_pages_text(pdf_path: str) -> List[str]:
     doc = fitz.open(pdf_path)
-    text_parts = []
+    pages_text = []
 
     for page in doc:
-        text_parts.append(page.get_text("text") or "")
+        pages_text.append(page.get_text("text") or "")
 
     doc.close()
-    return "\n".join(text_parts)
+    return pages_text
 
 
 def confidence_score(decoration: Decoration) -> float:
@@ -703,10 +736,22 @@ def dedupe_decorations(decorations: List[Decoration]) -> List[Decoration]:
 
 
 def extract_decorations(pdf_path: str) -> ExtractResponse:
-    plumber_text = pdfplumber_text(pdf_path)
-    mupdf_text = pymupdf_text(pdf_path)
+    plumber_pages = pdfplumber_pages_text(pdf_path)
+    mupdf_pages = pymupdf_pages_text(pdf_path)
 
-    full_text = plumber_text if len(plumber_text) >= len(mupdf_text) else mupdf_text
+    page_count = max(len(plumber_pages), len(mupdf_pages))
+
+    pages = []
+
+    for i in range(page_count):
+        plumber_text = plumber_pages[i] if i < len(plumber_pages) else ""
+        mupdf_text = mupdf_pages[i] if i < len(mupdf_pages) else ""
+
+        best_text = plumber_text if len(plumber_text) >= len(mupdf_text) else mupdf_text
+
+        pages.append(best_text)
+
+    full_text = "\n".join(pages)
     cleaned_text = clean_pdf_text(full_text)
 
     catalog_lookup = lookup_product_from_catalog(cleaned_text)
@@ -728,64 +773,132 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
         else "text_fallback"
     )
 
-    print_types = extract_print_types(cleaned_text)
-    dimensions = extract_dimension_specs(cleaned_text)
     colors = extract_colors(cleaned_text)
 
     decorations = []
-    count = max(len(print_types), len(dimensions))
 
-    for i in range(count):
-        raw_print_type = print_types[i] if i < len(print_types) else None
-        dim = dimensions[i] if i < len(dimensions) else {}
+    # Prefer detail pages, not summary page.
+    # Page 1 usually contains both front/back together and can create duplicates.
+    detail_page_indexes = list(range(1, page_count)) if page_count > 1 else [0]
 
-        width = dim.get("width")
-        height = dim.get("height")
-        placement_offset_raw = dim.get("placement_offset_raw")
+    detail_page_decorations = []
 
-        if is_placeholder(raw_print_type):
-            continue
+    for page_index in detail_page_indexes:
+        page_number = page_index + 1
+        page_text = clean_pdf_text(pages[page_index])
 
-        location_key = infer_print_location(
-            product_type=product_type,
-            width=width,
-            height=height,
-            placement_offset_raw=placement_offset_raw,
-            decoration_index=i,
-            total_decorations=count,
-        )
+        print_types = extract_print_types(page_text)
+        dimensions = extract_dimension_specs(page_text)
 
-        dec = Decoration(
-            location=location_key,
-            raw_print_type=raw_print_type,
-            print_type=normalize_print_type(raw_print_type),
+        count = max(len(print_types), len(dimensions))
 
-            placement_raw=location_key,
-            placement_key=location_key,
-            placement_offset_raw=placement_offset_raw,
+        for i in range(count):
+            raw_print_type = print_types[i] if i < len(print_types) else None
+            dim = dimensions[i] if i < len(dimensions) else {}
 
-            width_in=width,
-            height_in=height,
-            orientation=orientation(width, height),
-            colors=colors,
-            specialty_print=extract_specialty_print(raw_print_type),
-            page=1,
-        )
+            width = dim.get("width")
+            height = dim.get("height")
+            placement_offset_raw = dim.get("placement_offset_raw")
 
-        dec.confidence = confidence_score(dec)
+            if is_placeholder(raw_print_type):
+                continue
 
-        if dec.raw_print_type or dec.width_in or dec.height_in:
-            decorations.append(dec)
+            location_key = infer_print_location(
+                product_type=product_type,
+                width=width,
+                height=height,
+                placement_offset_raw=placement_offset_raw,
+                decoration_index=len(detail_page_decorations),
+                total_decorations=max(1, page_count - 1),
+                page_number=page_number,
+            )
+
+            if location_key in [None, "UNKNOWN"]:
+                continue
+
+            dec = Decoration(
+                location=location_key,
+                raw_print_type=raw_print_type,
+                print_type=normalize_print_type(raw_print_type),
+                placement_raw=location_key,
+                placement_key=location_key,
+                placement_offset_raw=placement_offset_raw,
+                width_in=width,
+                height_in=height,
+                orientation=orientation(width, height),
+                colors=colors,
+                specialty_print=extract_specialty_print(raw_print_type),
+                page=page_number,
+            )
+
+            dec.confidence = confidence_score(dec)
+
+            if dec.raw_print_type or dec.width_in or dec.height_in:
+                detail_page_decorations.append(dec)
+
+    decorations = detail_page_decorations
+
+    # Fallback to page 1 only if detail pages did not produce usable decorations.
+    if not decorations:
+        page_text = clean_pdf_text(pages[0]) if pages else cleaned_text
+        print_types = extract_print_types(page_text)
+        dimensions = extract_dimension_specs(page_text)
+
+        count = max(len(print_types), len(dimensions))
+
+        for i in range(count):
+            raw_print_type = print_types[i] if i < len(print_types) else None
+            dim = dimensions[i] if i < len(dimensions) else {}
+
+            width = dim.get("width")
+            height = dim.get("height")
+            placement_offset_raw = dim.get("placement_offset_raw")
+
+            if is_placeholder(raw_print_type):
+                continue
+
+            location_key = infer_print_location(
+                product_type=product_type,
+                width=width,
+                height=height,
+                placement_offset_raw=placement_offset_raw,
+                decoration_index=i,
+                total_decorations=count,
+                page_number=1,
+            )
+
+            if location_key in [None, "UNKNOWN"]:
+                continue
+
+            dec = Decoration(
+                location=location_key,
+                raw_print_type=raw_print_type,
+                print_type=normalize_print_type(raw_print_type),
+                placement_raw=location_key,
+                placement_key=location_key,
+                placement_offset_raw=placement_offset_raw,
+                width_in=width,
+                height_in=height,
+                orientation=orientation(width, height),
+                colors=colors,
+                specialty_print=extract_specialty_print(raw_print_type),
+                page=1,
+            )
+
+            dec.confidence = confidence_score(dec)
+
+            if dec.raw_print_type or dec.width_in or dec.height_in:
+                decorations.append(dec)
 
     decorations = dedupe_decorations(decorations)
 
     doc = fitz.open(pdf_path)
-    page_count = doc.page_count
+    real_page_count = doc.page_count
     doc.close()
 
     return ExtractResponse(
         filename=os.path.basename(pdf_path),
-        pages=page_count,
+        pages=real_page_count,
         product_code=product_code,
         product_title=product_title,
         catalog_product_name=catalog_product_name,
