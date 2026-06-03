@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any, Dict
 import fitz  # PyMuPDF
 import pdfplumber
 import tempfile
@@ -47,25 +47,38 @@ PRINT_TYPE_MAP = {
     "digital print": "DIGITAL_PRINT",
 }
 
-PRODUCT_KEYWORDS = {
-    "polo": "POLO",
-    "shirt": "SHIRT",
-    "tee": "T_SHIRT",
-    "hoodie": "HOODIE",
-    "crewneck": "CREWNECK",
-    "sweatshirt": "SWEATSHIRT",
-    "quarter zip": "QUARTER_ZIP",
-    "qz": "QUARTER_ZIP",
-    "hat": "HAT",
-    "cap": "CAP",
-    "short": "SHORTS",
-    "pant": "PANTS",
-    "tote": "TOTE",
-    "bag": "BAG",
-    "banner": "BANNER",
-    "sticker": "STICKER",
-    "poster": "POSTER",
-}
+VALID_PRINT_TYPES = [
+    "Screen Printing",
+    "Screen Print",
+    "Embroidery",
+    "DTF",
+    "DTG",
+    "Full Color",
+    "Vinyl",
+    "Sublimation",
+    "Patch",
+    "Digital Print",
+]
+
+PRODUCT_KEYWORDS = [
+    "polo",
+    "shirt",
+    "tee",
+    "hoodie",
+    "crewneck",
+    "sweatshirt",
+    "quarter zip",
+    "qz",
+    "hat",
+    "cap",
+    "short",
+    "pant",
+    "tote",
+    "bag",
+    "banner",
+    "sticker",
+    "poster",
+]
 
 SPECIALTY_KEYWORDS = {
     "puff": "PUFF",
@@ -79,17 +92,37 @@ SPECIALTY_KEYWORDS = {
     "flock": "FLOCK",
 }
 
+PLACEHOLDER_RE = re.compile(r"\[\[.*?\]\]")
+
 
 def clean_text(value: Any) -> str:
     return str(value or "").replace("\u00a0", " ").strip()
 
 
 def normalize_space(value: str) -> str:
-    return re.sub(r"\s+", " ", clean_text(value))
+    return re.sub(r"\s+", " ", clean_text(value)).strip()
+
+
+def clean_pdf_text(text: str) -> str:
+    text = text or ""
+    text = text.replace("”", '"')
+    text = text.replace("“", '"')
+    text = text.replace("′", "'")
+    text = text.replace("’", "'")
+    text = text.replace("–", "-")
+    text = text.replace("—", "-")
+    text = text.replace("\u00a0", " ")
+    return normalize_space(text)
+
+
+def is_placeholder(value: Optional[str]) -> bool:
+    if not value:
+        return True
+    return bool(PLACEHOLDER_RE.search(str(value)))
 
 
 def normalize_print_type(value: Optional[str]) -> Optional[str]:
-    if not value:
+    if not value or is_placeholder(value):
         return None
 
     key = normalize_space(value).lower()
@@ -102,7 +135,7 @@ def normalize_print_type(value: Optional[str]) -> Optional[str]:
 
 
 def extract_specialty_print(value: Optional[str]) -> List[str]:
-    if not value:
+    if not value or is_placeholder(value):
         return []
 
     key = normalize_space(value).lower()
@@ -116,7 +149,7 @@ def extract_specialty_print(value: Optional[str]) -> List[str]:
 
 
 def normalize_placement(value: Optional[str]) -> Optional[str]:
-    if not value:
+    if not value or is_placeholder(value):
         return None
 
     key = normalize_space(value).lower()
@@ -151,23 +184,55 @@ def extract_product_type(product_title: Optional[str]) -> Optional[str]:
     if not product_title:
         return None
 
-    key = normalize_space(product_title).lower()
+    title = normalize_space(product_title).lower()
 
-    for raw, normalized in PRODUCT_KEYWORDS.items():
-        if raw in key:
-            return normalized
+    if "polo" in title:
+        return "POLO"
+    if "hoodie" in title:
+        return "HOODIE"
+    if "crewneck" in title:
+        return "CREWNECK"
+    if "sweatshirt" in title:
+        return "SWEATSHIRT"
+    if "quarter zip" in title or "qz" in title:
+        return "QUARTER_ZIP"
+    if "shirt" in title or "tee" in title:
+        return "SHIRT"
+    if "hat" in title or "cap" in title:
+        return "HAT"
+    if "short" in title:
+        return "SHORTS"
+    if "pant" in title:
+        return "PANTS"
+    if "tote" in title:
+        return "TOTE"
+    if "bag" in title:
+        return "BAG"
+    if "banner" in title:
+        return "BANNER"
+    if "sticker" in title:
+        return "STICKER"
+    if "poster" in title:
+        return "POSTER"
 
     return "OTHER"
 
 
 def extract_colors(text: str) -> List[str]:
+    text = clean_pdf_text(text)
     colors = []
 
     pantones = re.findall(r"(?:PANTONE\s*)?\b\d{3,4}\s*C\b", text, flags=re.I)
+
     for color in pantones:
         color = normalize_space(color).upper()
+
+        if color in ["000", "000C", "PANTONE 000", "PANTONE 000C"]:
+            continue
+
         if not color.startswith("PANTONE"):
             color = f"PANTONE {color}"
+
         colors.append(color)
 
     if re.search(r"\bSPOT\s+WHITE\b", text, flags=re.I):
@@ -175,27 +240,107 @@ def extract_colors(text: str) -> List[str]:
     elif re.search(r"\bWHITE\b", text, flags=re.I):
         colors.append("WHITE")
 
-    return sorted(set(colors))
+    clean_colors = []
+
+    for color in colors:
+        color = normalize_space(color).upper()
+
+        if color in ["000", "000C", "PANTONE 000", "PANTONE 000C"]:
+            continue
+
+        clean_colors.append(color)
+
+    return sorted(set(clean_colors))
 
 
-def parse_dimensions(text: str):
-    patterns = [
-        r"Dimensions:\s*([\d.]+)\s*[\"']?\s*w\s*x\s*([\d.]+)\s*[\"']?\s*h\s*(?:-\s*([^\n\r]+))?",
-        r"Size:\s*([\d.]+)\s*[\"']?\s*w\s*x\s*([\d.]+)\s*[\"']?\s*h\s*(?:-\s*([^\n\r]+))?",
-        r"Approx\.?:?\s*([\d.]+)\s*[\"']?\s*w\s*x\s*([\d.]+)\s*[\"']?\s*h\s*(?:-\s*([^\n\r]+))?",
-        r"([\d.]+)\s*[\"']?\s*w\s*x\s*([\d.]+)\s*[\"']?\s*h\s*(?:-\s*([^\n\r]+))?",
-    ]
+DIMENSION_RE = re.compile(
+    r"""
+    (?:Dimensions:\s*)?
+    (?:Approx\.?\s*)?
+    (?P<width>\d+(?:\.\d+)?)
+    \s*["']?
+    \s*w
+    \s*x
+    \s*
+    (?P<height>\d+(?:\.\d+)?)
+    \s*["']?
+    \s*h
+    (?:\s*-\s*(?P<placement>.*?))?
+    (?=
+        \s+Print\s*Type:
+        |\s+Dimensions:
+        |\s+White
+        |\s+Black
+        |\s+Pantone
+        |\s+PANTONE
+        |\s+Proof
+        |$
+    )
+    """,
+    re.I | re.X,
+)
 
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.I)
-        if match:
-            width = float(match.group(1))
-            height = float(match.group(2))
-            placement_raw = normalize_space(match.group(3)) if len(match.groups()) >= 3 and match.group(3) else None
 
-            return width, height, placement_raw
+def extract_dimension_specs(text: str) -> List[Dict[str, Any]]:
+    text = clean_pdf_text(text)
+    results = []
 
-    return None, None, None
+    for match in DIMENSION_RE.finditer(text):
+        width = float(match.group("width"))
+        height = float(match.group("height"))
+        placement = match.group("placement")
+
+        if placement:
+            placement = normalize_space(placement)
+
+        if is_placeholder(placement):
+            placement = None
+
+        results.append(
+            {
+                "width": width,
+                "height": height,
+                "placement": placement,
+            }
+        )
+
+    return results
+
+
+def extract_print_types(text: str) -> List[str]:
+    text = clean_pdf_text(text)
+    results = []
+
+    pattern = re.compile(
+        r"Print\s*Type:\s*(?P<value>.*?)(?=\s+Print\s*Type:|\s+Dimensions:|\s+Size:|\s+Approx\.?:|\s+Proof|$)",
+        flags=re.I,
+    )
+
+    for match in pattern.finditer(text):
+        value = normalize_space(match.group("value"))
+
+        if is_placeholder(value):
+            continue
+
+        matched_valid = None
+
+        for pt in VALID_PRINT_TYPES:
+            if re.search(rf"\b{re.escape(pt)}\b", value, flags=re.I):
+                matched_valid = pt
+                break
+
+        if matched_valid:
+            results.append(matched_valid)
+
+    if results:
+        return results
+
+    for pt in VALID_PRINT_TYPES:
+        matches = re.findall(rf"\b{re.escape(pt)}\b", text, flags=re.I)
+        for _ in matches:
+            results.append(pt)
+
+    return results
 
 
 def orientation(width: Optional[float], height: Optional[float]) -> Optional[str]:
@@ -209,42 +354,38 @@ def orientation(width: Optional[float], height: Optional[float]) -> Optional[str
 
 
 def extract_product_title(full_text: str) -> Optional[str]:
-    lines = [normalize_space(x) for x in full_text.splitlines() if normalize_space(x)]
+    lines = [
+        normalize_space(x)
+        for x in re.split(r"\n|\r", full_text)
+        if normalize_space(x)
+    ]
+
+    if not lines:
+        lines = [
+            normalize_space(x)
+            for x in re.split(r"(?=Print Type:|Dimensions:|Proof #)", full_text)
+            if normalize_space(x)
+        ]
 
     for line in lines:
         lower = line.lower()
-        if any(k in lower for k in PRODUCT_KEYWORDS.keys()):
-            if not lower.startswith(("print type", "dimensions", "size", "proof")):
-                return line
+
+        if lower.startswith(("print type", "dimensions", "size", "proof")):
+            continue
+
+        if any(keyword in lower for keyword in PRODUCT_KEYWORDS):
+            return line
+
+    text = clean_pdf_text(full_text)
+    before_print_type = re.split(r"Print\s*Type:", text, flags=re.I)[0]
+    candidates = [normalize_space(x) for x in before_print_type.split("  ") if normalize_space(x)]
+
+    for candidate in candidates:
+        lower = candidate.lower()
+        if any(keyword in lower for keyword in PRODUCT_KEYWORDS):
+            return candidate
 
     return None
-
-
-def pymupdf_text_blocks(pdf_path: str) -> List[Dict[str, Any]]:
-    doc = fitz.open(pdf_path)
-    blocks = []
-
-    for page_index, page in enumerate(doc):
-        page_blocks = page.get_text("blocks")
-
-        for block in page_blocks:
-            x0, y0, x1, y1, text, block_no, block_type = block
-
-            text = clean_text(text)
-            if not text:
-                continue
-
-            blocks.append({
-                "page": page_index + 1,
-                "x0": x0,
-                "y0": y0,
-                "x1": x1,
-                "y1": y1,
-                "text": text,
-            })
-
-    doc.close()
-    return blocks
 
 
 def pdfplumber_text(pdf_path: str) -> str:
@@ -258,70 +399,15 @@ def pdfplumber_text(pdf_path: str) -> str:
     return "\n".join(full_text)
 
 
-def group_nearby_spec_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Finds blocks around Print Type / Dimensions / Size labels.
-    This is layout-aware, so it is more reliable than plain full-text regex.
-    """
-    spec_blocks = []
+def pymupdf_text(pdf_path: str) -> str:
+    doc = fitz.open(pdf_path)
+    text_parts = []
 
-    for block in blocks:
-        text = block["text"]
+    for page in doc:
+        text_parts.append(page.get_text("text") or "")
 
-        if re.search(r"\bPrint Type\b|\bDimensions\b|\bSize\b|\bApprox\b", text, flags=re.I):
-            page = block["page"]
-
-            nearby = [
-                b for b in blocks
-                if b["page"] == page
-                and abs(b["y0"] - block["y0"]) < 180
-                and abs(b["x0"] - block["x0"]) < 350
-            ]
-
-            combined = "\n".join(b["text"] for b in sorted(nearby, key=lambda b: (b["y0"], b["x0"])))
-
-            spec_blocks.append({
-                "page": page,
-                "x0": block["x0"],
-                "y0": block["y0"],
-                "text": combined,
-            })
-
-    # Dedupe similar blocks
-    seen = set()
-    deduped = []
-
-    for block in spec_blocks:
-        key = (block["page"], round(block["x0"], -1), round(block["y0"], -1))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(block)
-
-    return deduped
-
-
-def extract_print_type_from_block(text: str) -> Optional[str]:
-    inline = re.search(r"Print Type:\s*([^\n\r]+)", text, flags=re.I)
-    if inline:
-        candidate = normalize_space(inline.group(1))
-        if not re.match(r"^(Dimensions|Size|Approx)\b", candidate, flags=re.I):
-            return candidate
-
-    lines = [normalize_space(x) for x in text.splitlines() if normalize_space(x)]
-
-    for i, line in enumerate(lines):
-        if re.match(r"^Print Type:?\s*$", line, flags=re.I):
-            for candidate in lines[i + 1:i + 5]:
-                if re.match(r"^(Dimensions|Size|Approx|Shape):?", candidate, flags=re.I):
-                    continue
-                return candidate
-
-    for line in lines:
-        if normalize_print_type(line) not in [None, "OTHER"]:
-            return line
-
-    return None
+    doc.close()
+    return "\n".join(text_parts)
 
 
 def confidence_score(decoration: Decoration) -> float:
@@ -343,51 +429,59 @@ def confidence_score(decoration: Decoration) -> float:
     return min(100, score) / 100
 
 
+def dedupe_decorations(decorations: List[Decoration]) -> List[Decoration]:
+    seen = set()
+    output = []
+
+    for dec in decorations:
+        key = (
+            dec.raw_print_type,
+            dec.print_type,
+            dec.width_in,
+            dec.height_in,
+            dec.placement_key,
+            tuple(dec.colors),
+            dec.page,
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        output.append(dec)
+
+    return output
+
+
 def extract_decorations(pdf_path: str) -> ExtractResponse:
-    blocks = pymupdf_text_blocks(pdf_path)
-    full_text = pdfplumber_text(pdf_path)
+    plumber_text = pdfplumber_text(pdf_path)
+    mupdf_text = pymupdf_text(pdf_path)
+
+    full_text = plumber_text if len(plumber_text) >= len(mupdf_text) else mupdf_text
+    full_text = clean_pdf_text(full_text)
 
     product_title = extract_product_title(full_text)
     product_type = extract_product_type(product_title)
 
-    spec_blocks = group_nearby_spec_blocks(blocks)
+    print_types = extract_print_types(full_text)
+    dimensions = extract_dimension_specs(full_text)
+    colors = extract_colors(full_text)
 
     decorations = []
 
-    for block in spec_blocks:
-        block_text = block["text"]
+    count = max(len(print_types), len(dimensions))
 
-        raw_print_type = extract_print_type_from_block(block_text)
-        print_type = normalize_print_type(raw_print_type)
+    for i in range(count):
+        raw_print_type = print_types[i] if i < len(print_types) else None
 
-        width, height, placement_raw = parse_dimensions(block_text)
+        dim = dimensions[i] if i < len(dimensions) else {}
 
-        colors = extract_colors(block_text) or extract_colors(full_text)
-        specialty_print = extract_specialty_print(raw_print_type)
+        width = dim.get("width")
+        height = dim.get("height")
+        placement_raw = dim.get("placement")
 
-        dec = Decoration(
-            location=normalize_placement(placement_raw),
-            raw_print_type=raw_print_type,
-            print_type=print_type,
-            placement_raw=placement_raw,
-            placement_key=normalize_placement(placement_raw),
-            width_in=width,
-            height_in=height,
-            orientation=orientation(width, height),
-            colors=colors,
-            specialty_print=specialty_print,
-            page=block["page"],
-        )
-
-        dec.confidence = confidence_score(dec)
-
-        if dec.raw_print_type or dec.width_in or dec.height_in:
-            decorations.append(dec)
-
-    # Fallback if layout blocks fail
-    if not decorations:
-        raw_print_type = extract_print_type_from_block(full_text)
-        width, height, placement_raw = parse_dimensions(full_text)
+        if is_placeholder(raw_print_type):
+            continue
 
         dec = Decoration(
             location=normalize_placement(placement_raw),
@@ -398,13 +492,17 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
             width_in=width,
             height_in=height,
             orientation=orientation(width, height),
-            colors=extract_colors(full_text),
+            colors=colors,
             specialty_print=extract_specialty_print(raw_print_type),
             page=1,
         )
 
         dec.confidence = confidence_score(dec)
-        decorations.append(dec)
+
+        if dec.raw_print_type or dec.width_in or dec.height_in:
+            decorations.append(dec)
+
+    decorations = dedupe_decorations(decorations)
 
     doc = fitz.open(pdf_path)
     page_count = doc.page_count
@@ -416,7 +514,7 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
         product_title=product_title,
         product_type=product_type,
         decorations=decorations,
-        raw_text_preview=full_text[:1000],
+        raw_text_preview=full_text[:1500],
     )
 
 
@@ -424,7 +522,7 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
 def health():
     return {
         "status": "ok",
-        "service": "Fresh Prints PDF Spec Extractor"
+        "service": "Fresh Prints PDF Spec Extractor",
     }
 
 
