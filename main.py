@@ -105,7 +105,7 @@ def clean_text(value: Any) -> str:
     return str(value or "").replace("\u00a0", " ").strip()
 
 
-def normalize_space(value: str) -> str:
+def normalize_space(value: Any) -> str:
     return re.sub(r"\s+", " ", clean_text(value)).strip()
 
 
@@ -124,6 +124,10 @@ def clean_pdf_text(text: str) -> str:
 
 def normalize_code(value: Any) -> str:
     return normalize_space(value).upper()
+
+
+def normalize_header(value: Any) -> str:
+    return normalize_space(value).lower().replace(" ", "_")
 
 
 def normalize_product_type(value: Optional[str]) -> Optional[str]:
@@ -175,6 +179,8 @@ def load_product_catalog() -> Dict[str, Dict[str, str]]:
 
     if not os.path.exists(CATALOG_PATH):
         print(f"Product catalog not found at {CATALOG_PATH}.")
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"Files in directory: {os.listdir('.')}")
         return catalog
 
     encodings = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
@@ -194,29 +200,31 @@ def load_product_catalog() -> Dict[str, Dict[str, str]]:
                 delimiter = "\t" if "\t" in sample else ","
                 reader = csv.DictReader(f, delimiter=delimiter)
 
-                for row in reader:
+                for raw_row in reader:
+                    row = {
+                        normalize_header(k): v
+                        for k, v in raw_row.items()
+                        if k is not None
+                    }
+
                     product_code = normalize_code(
-                        row.get("Product Code")
-                        or row.get("product_code")
-                        or row.get("Style Code")
+                        row.get("product_code")
                         or row.get("style_code")
+                        or row.get("code")
                     )
 
                     if not product_code:
                         continue
 
                     product_name = normalize_space(
-                        row.get("Product Name")
-                        or row.get("product_name")
-                        or row.get("Name")
+                        row.get("product_name")
                         or row.get("name")
                     )
 
                     classification = normalize_space(
-                        row.get("Classification")
-                        or row.get("classification")
-                        or row.get("Product Type")
+                        row.get("classification")
                         or row.get("product_type")
+                        or row.get("type")
                         or "Other"
                     )
 
@@ -233,6 +241,7 @@ def load_product_catalog() -> Dict[str, Dict[str, str]]:
         except Exception as e:
             print(f"Failed to load catalog using {encoding}: {e}")
 
+    print("Could not load product catalog.")
     return {}
 
 
@@ -273,7 +282,6 @@ def find_product_code(text: str) -> Optional[str]:
     cleaned = clean_pdf_text(text)
     text_upper = cleaned.upper()
 
-    # 1. Prefer catalog codes anywhere in PDF text
     if PRODUCT_CATALOG:
         for code in sorted(PRODUCT_CATALOG.keys(), key=len, reverse=True):
             code_upper = normalize_code(code)
@@ -284,7 +292,6 @@ def find_product_code(text: str) -> Optional[str]:
             ):
                 return code_upper
 
-    # 2. Search product-title-like lines first
     raw_lines = [
         normalize_space(line)
         for line in re.split(r"\n|\r", text or "")
@@ -325,15 +332,12 @@ def find_product_code(text: str) -> Optional[str]:
         if code in bad_codes:
             continue
 
-        # Ignore Pantone-like colors such as 4525 C or 266 C
         if re.search(rf"\b{re.escape(code)}\s*C\b", text_upper):
             continue
 
-        # Ignore common proof/order number prefixes from examples
         if code.startswith("277") or code.startswith("368"):
             continue
 
-        # Avoid long proof/order-like pure numbers
         if re.fullmatch(r"\d{6,}", code):
             continue
 
@@ -808,10 +812,8 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
 
     colors = extract_colors(cleaned_text)
 
-    decorations = []
-
     detail_page_indexes = list(range(1, page_count)) if page_count > 1 else [0]
-    detail_page_decorations = []
+    decorations = []
 
     for page_index in detail_page_indexes:
         page_number = page_index + 1
@@ -838,7 +840,7 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
                 width=width,
                 height=height,
                 placement_offset_raw=placement_offset_raw,
-                decoration_index=len(detail_page_decorations),
+                decoration_index=len(decorations),
                 total_decorations=max(1, page_count - 1),
                 page_number=page_number,
             )
@@ -864,9 +866,7 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
             dec.confidence = confidence_score(dec)
 
             if dec.raw_print_type or dec.width_in or dec.height_in:
-                detail_page_decorations.append(dec)
-
-    decorations = detail_page_decorations
+                decorations.append(dec)
 
     if not decorations:
         page_text = clean_pdf_text(pages[0]) if pages else cleaned_text
@@ -945,6 +945,8 @@ def health():
         "service": "Fresh Prints PDF Spec Extractor",
         "catalog_rows_loaded": len(PRODUCT_CATALOG),
         "catalog_path": CATALOG_PATH,
+        "cwd": os.getcwd(),
+        "files": os.listdir("."),
     }
 
 
