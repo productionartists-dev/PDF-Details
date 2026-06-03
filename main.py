@@ -267,10 +267,12 @@ DIMENSION_RE = re.compile(
     \s*h
     (?:\s*-\s*(?P<placement>.*?))?
     (?=
-        \s+Print\s*Type:
-        |\s+Dimensions:
+        \s+Dimensions:
+        |\s+Print\s*Type:
         |\s+White
         |\s+Black
+        |\s+Vegas
+        |\s+Gold
         |\s+Pantone
         |\s+PANTONE
         |\s+Proof
@@ -288,10 +290,18 @@ def extract_dimension_specs(text: str) -> List[Dict[str, Any]]:
     for match in DIMENSION_RE.finditer(text):
         width = float(match.group("width"))
         height = float(match.group("height"))
+
         placement = match.group("placement")
 
         if placement:
             placement = normalize_space(placement)
+            placement = re.sub(r"\s+Dimensions:.*$", "", placement, flags=re.I).strip()
+            placement = re.sub(r"\s+Print\s*Type:.*$", "", placement, flags=re.I).strip()
+            placement = re.sub(r"\s+White.*$", "", placement, flags=re.I).strip()
+            placement = re.sub(r"\s+Black.*$", "", placement, flags=re.I).strip()
+            placement = re.sub(r"\s+Vegas.*$", "", placement, flags=re.I).strip()
+            placement = re.sub(r"\s+Gold.*$", "", placement, flags=re.I).strip()
+            placement = re.sub(r"\s+Proof.*$", "", placement, flags=re.I).strip()
 
         if is_placeholder(placement):
             placement = None
@@ -354,18 +364,13 @@ def orientation(width: Optional[float], height: Optional[float]) -> Optional[str
 
 
 def extract_product_title(full_text: str) -> Optional[str]:
+    original_text = full_text or ""
+
     lines = [
         normalize_space(x)
-        for x in re.split(r"\n|\r", full_text)
+        for x in re.split(r"\n|\r", original_text)
         if normalize_space(x)
     ]
-
-    if not lines:
-        lines = [
-            normalize_space(x)
-            for x in re.split(r"(?=Print Type:|Dimensions:|Proof #)", full_text)
-            if normalize_space(x)
-        ]
 
     for line in lines:
         lower = line.lower()
@@ -376,12 +381,15 @@ def extract_product_title(full_text: str) -> Optional[str]:
         if any(keyword in lower for keyword in PRODUCT_KEYWORDS):
             return line
 
-    text = clean_pdf_text(full_text)
+    text = clean_pdf_text(original_text)
     before_print_type = re.split(r"Print\s*Type:", text, flags=re.I)[0]
-    candidates = [normalize_space(x) for x in before_print_type.split("  ") if normalize_space(x)]
+
+    candidates = re.split(r"\s{2,}|(?=[A-Z][a-z]+[+\s].*(?:Shirt|Polo|Hat|Cap|Tote|Bag|Hoodie|Short|Pant|Banner))", before_print_type)
 
     for candidate in candidates:
+        candidate = normalize_space(candidate)
         lower = candidate.lower()
+
         if any(keyword in lower for keyword in PRODUCT_KEYWORDS):
             return candidate
 
@@ -441,7 +449,6 @@ def dedupe_decorations(decorations: List[Decoration]) -> List[Decoration]:
             dec.height_in,
             dec.placement_key,
             tuple(dec.colors),
-            dec.page,
         )
 
         if key in seen:
@@ -458,14 +465,15 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
     mupdf_text = pymupdf_text(pdf_path)
 
     full_text = plumber_text if len(plumber_text) >= len(mupdf_text) else mupdf_text
-    full_text = clean_pdf_text(full_text)
+
+    cleaned_text = clean_pdf_text(full_text)
 
     product_title = extract_product_title(full_text)
     product_type = extract_product_type(product_title)
 
-    print_types = extract_print_types(full_text)
-    dimensions = extract_dimension_specs(full_text)
-    colors = extract_colors(full_text)
+    print_types = extract_print_types(cleaned_text)
+    dimensions = extract_dimension_specs(cleaned_text)
+    colors = extract_colors(cleaned_text)
 
     decorations = []
 
@@ -473,7 +481,6 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
 
     for i in range(count):
         raw_print_type = print_types[i] if i < len(print_types) else None
-
         dim = dimensions[i] if i < len(dimensions) else {}
 
         width = dim.get("width")
@@ -514,7 +521,7 @@ def extract_decorations(pdf_path: str) -> ExtractResponse:
         product_title=product_title,
         product_type=product_type,
         decorations=decorations,
-        raw_text_preview=full_text[:1500],
+        raw_text_preview=cleaned_text[:1500],
     )
 
 
